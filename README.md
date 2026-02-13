@@ -1,5 +1,7 @@
 # fuzzmyagent.ai
 
+<img width="500" height="500" alt="logo" src="https://github.com/user-attachments/assets/553a8488-4e5c-41a3-9cbe-a1b6990087dd" />
+
 Property-based fuzz testing web app for agent-to-agent endpoints.
 
 ## What fuzzmyagent does
