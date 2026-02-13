@@ -496,12 +496,20 @@ async def _run_wizard_job(
             passed = False
 
             try:
+                # Pass agent card so the client can prefer A2A JSON-RPC shapes when protocolVersion is present.
+                agent_card = {}
+                try:
+                    agent_card = json.loads((run.agent_card_json or "{}")) or {}
+                except Exception:
+                    agent_card = {}
+
                 call = await call_a2a_adaptive(
                     endpoint=endpoint,
                     prompt=tc.prompt,
                     meta={"run_id": run_id, "testcase_id": tc.id},
                     headers={},
                     timeout_s=timeout_s,
+                    agent_card=agent_card,
                 )
                 trace["latency_ms"] = call["latency_ms"]
                 trace["raw"] = call["raw"]

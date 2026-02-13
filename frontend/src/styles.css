@@ -319,6 +319,29 @@ pre {
   animation: spin 1s linear infinite;
 }
 
+.spinner-xs {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.2);
+  border-top-color: #93a9ff;
+  animation: spin 1s linear infinite;
+  margin-right: 6px;
+  vertical-align: -2px;
+}
+
+.pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(219, 231, 255, .92);
+}
+
+.row-current td {
+  background: rgba(79, 116, 255, .10);
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
 }

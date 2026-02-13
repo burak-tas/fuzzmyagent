@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   createTestcase,
@@ -32,6 +32,8 @@ type ReportResult = {
   rule_results: Array<{ rule_id: string; ok: boolean; severity: string; message: string; evidence?: string }>;
   trace: { latency_ms?: number; [k: string]: unknown };
 };
+
+type LiveStatus = "queued" | "running" | "done";
 
 type Toast = { id: string; kind: "ok" | "err"; text: string };
 
@@ -128,40 +130,10 @@ function previewRulesYaml(cfg: RuleConfig): string {
   return lines.join("\n");
 }
 
-function findFirstTextField(value: unknown): string {
-  if (typeof value === "string") return "";
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findFirstTextField(item);
-      if (found) return found;
-    }
-    return "";
-  }
-  if (!value || typeof value !== "object") return "";
-  const obj = value as Record<string, unknown>;
-  if (typeof obj.text === "string" && obj.text.trim()) return obj.text.trim();
-  for (const child of Object.values(obj)) {
-    const found = findFirstTextField(child);
-    if (found) return found;
-  }
-  return "";
-}
-
 function extractResultForTable(responseText: string): string {
-  const input = (responseText || "").trim();
-  if (!input) return "";
-
-  try {
-    const parsed = JSON.parse(input);
-    const found = findFirstTextField(parsed);
-    if (found) return found;
-  } catch {
-    // keep fallback below
-  }
-
-  const lineMatch = input.match(/(?:^|\n)\s*text\s*:\s*(.+)/i);
-  if (lineMatch && lineMatch[1]) return lineMatch[1].trim();
-  return input;
+  // Reverted: show the original response text (truncated in the table),
+  // instead of extracting nested "text" fields from JSON.
+  return (responseText || "").trim();
 }
 
 function parseCSV(text: string): Array<{ prompt: string }> {
@@ -304,6 +276,11 @@ export default function App() {
 
   const [report, setReport] = useState<{ summary?: Record<string, unknown>; results?: ReportResult[] }>({});
   const [selectedResult, setSelectedResult] = useState<ReportResult | null>(null);
+  const [currentTestcaseId, setCurrentTestcaseId] = useState("");
+  const [statusById, setStatusById] = useState<Record<string, LiveStatus>>({});
+  const doneSetRef = useRef<Set<string>>(new Set());
+  const rowRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
+  const lastReportFetchRef = useRef(0);
 
   const [toasts, setToasts] = useState<Toast[]>([]);
 
@@ -337,6 +314,20 @@ export default function App() {
     return Math.round((passed / total) * 100);
   }, [reportResults]);
 
+  const reportById = useMemo(() => {
+    const m = new Map<string, ReportResult>();
+    for (const r of reportResults) m.set(r.testcase_id, r);
+    return m;
+  }, [reportResults]);
+
+  const reportTableRows = useMemo(() => {
+    return testcases.map((tc) => {
+      const r = reportById.get(tc.testcase_id);
+      const status = statusById[tc.testcase_id] || (r ? "done" : "queued");
+      return { tc, r, status };
+    });
+  }, [testcases, reportById, statusById]);
+
   useEffect(() => {
     if (!window.location.pathname.startsWith("/wizard/")) {
       window.history.replaceState({}, "", pathFor("start"));
@@ -359,18 +350,23 @@ export default function App() {
   }, [rememberKey, openAiKey]);
 
   useEffect(() => {
-    if (step !== "generate") return;
-    if (!runId || !openAiKey) return;
-    if (genBusy || testcases.length > 0) return;
-    void doGenerate();
+    if (step !== "testcases") return;
+    if (!runId) return;
+    // On reload/back navigation, rehydrate from backend.
+    if (testcases.length > 0) return;
+    void refreshTestcases();
   }, [step]);
 
   useEffect(() => {
-    if (step !== "run") return;
-    if (!runId || runBusy) return;
-    if (!testcases.length) return;
-    void doRun();
-  }, [step]);
+    if (!currentTestcaseId) return;
+    const el = rowRefs.current[currentTestcaseId];
+    if (!el) return;
+    try {
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+    } catch {
+      // ignore
+    }
+  }, [currentTestcaseId]);
 
   function toast(kind: "ok" | "err", text: string) {
     const t = { id: uid(), kind, text };
@@ -543,6 +539,14 @@ export default function App() {
 
     setRunBusy(true);
     setRunProgress({ done: 0, total: testcases.length, pass: 0, fail: 0, avgLatency: 0 });
+    setSelectedResult(null);
+    // Pre-populate table and jump into the report view immediately.
+    const initial: Record<string, LiveStatus> = {};
+    for (const tc of testcases) initial[tc.testcase_id] = "queued";
+    setStatusById(initial);
+    doneSetRef.current = new Set();
+    setCurrentTestcaseId(testcases[0]?.testcase_id || "");
+    goto("report");
 
     let totalLatency = 0;
     let seen = 0;
@@ -556,12 +560,33 @@ export default function App() {
         rules: rulesToObject(ruleCfg),
       });
 
+      const maybeRefreshReport = async () => {
+        const now = Date.now();
+        if (now - lastReportFetchRef.current < 1500) return;
+        lastReportFetchRef.current = now;
+        try {
+          const rep = await getReport(runId);
+          setReport(rep);
+        } catch {
+          // ignore
+        }
+      };
+
       const ws = runWebSocket(runId, async (evt) => {
         if (evt.type === "case_done") {
           seen += 1;
           if (evt.passed) pass += 1;
           else fail += 1;
           totalLatency += Number(evt.latency_ms || 0);
+          const tcId = String(evt.testcase_id || "");
+          if (tcId) {
+            doneSetRef.current.add(tcId);
+            setStatusById((prev) => ({ ...prev, [tcId]: "done" }));
+            // Move "current" pointer to the next not-yet-done testcase.
+            const next = testcases.find((t) => !doneSetRef.current.has(t.testcase_id));
+            setCurrentTestcaseId(next ? next.testcase_id : "");
+            if (next) setStatusById((prev) => ({ ...prev, [next.testcase_id]: "running" }));
+          }
           setRunProgress({
             done: Number(evt.done || seen),
             total: Number(evt.total || testcases.length),
@@ -569,6 +594,7 @@ export default function App() {
             fail,
             avgLatency: seen ? Math.round(totalLatency / seen) : 0,
           });
+          void maybeRefreshReport();
         }
 
         if (evt.type === "run_done") {
@@ -577,20 +603,9 @@ export default function App() {
           setReport(rep);
           setRunBusy(false);
           toast("ok", "Run finished.");
-          goto("report");
+          setCurrentTestcaseId("");
         }
       });
-
-      const poll = window.setInterval(async () => {
-        try {
-          const s = await getWizardRun(runId);
-          if (s.status !== "running" && s.status !== "ready") {
-            window.clearInterval(poll);
-          }
-        } catch {
-          window.clearInterval(poll);
-        }
-      }, 2000);
     } catch (e) {
       setRunBusy(false);
       toast("err", `Run failed: ${String(e)}`);
@@ -784,7 +799,25 @@ export default function App() {
               >
                 {skipBusy ? "Skipping..." : "Skip LLM generator"}
               </button>
-              <button className="btn btn-primary" onClick={() => goto("generate")} disabled={!openAiOk}>Next</button>
+              {testcases.length > 0 ? (
+                <>
+                  <button className="btn btn-primary" onClick={() => goto("testcases")}>
+                    Continue to review
+                  </button>
+                  <button className="btn btn-ghost" onClick={() => { goto("generate"); void doGenerate(); }} disabled={!openAiOk || genBusy}>
+                    {genBusy ? "Generating..." : "Start generating again"}
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => { goto("generate"); void doGenerate(); }}
+                  disabled={!openAiOk || genBusy}
+                  title="Start generating testcases with OpenAI."
+                >
+                  {genBusy ? "Generating..." : "Start generating"}
+                </button>
+              )}
             </div>
           </div>
         </section>
@@ -792,14 +825,30 @@ export default function App() {
 
       {step === "generate" ? (
         <section className="card single loading">
-          <h2>Generating test prompts with OpenAI...</h2>
-          <div className="spinner" />
+          <h2>{genBusy ? "Generating test prompts with OpenAI..." : "Generate testcases"}</h2>
+          {genBusy ? <div className="spinner" /> : null}
           <p className="muted">Run ID: {runId}</p>
-          {genBusy ? <p className="muted">Please wait while testcases are being generated.</p> : null}
+          {genBusy ? (
+            <p className="muted">Please wait while testcases are being generated.</p>
+          ) : testcases.length > 0 ? (
+            <p className="muted">Testcases are already generated. Continue to Review or generate again from Configure.</p>
+          ) : (
+            <p className="muted">Go back to Configure and click Start generating.</p>
+          )}
           {genError ? <p className="error">{genError}</p> : null}
           <div className="actions">
             <button className="btn btn-ghost" onClick={() => goto("config")}>Back</button>
             {genError ? <button className="btn btn-primary" onClick={() => void doGenerate()}>Retry</button> : null}
+            {!genBusy && !genError && testcases.length === 0 ? (
+              <button className="btn btn-primary" onClick={() => void doGenerate()} disabled={!openAiOk}>
+                Start generating
+              </button>
+            ) : null}
+            {!genBusy && !genError && testcases.length > 0 ? (
+              <button className="btn btn-primary" onClick={() => goto("testcases")}>
+                Continue to review
+              </button>
+            ) : null}
           </div>
         </section>
       ) : null}
@@ -863,7 +912,9 @@ export default function App() {
 
           <div className="actions">
             <button className="btn btn-ghost" onClick={() => goto("config")}>Back</button>
-            <button className="btn btn-primary" onClick={() => goto("run")} disabled={!testcases.length}>Start fuzzing</button>
+            <button className="btn btn-primary" onClick={() => void doRun()} disabled={!testcases.length || runBusy}>
+              {runBusy ? "Running..." : "Start fuzzing"}
+            </button>
           </div>
         </section>
       ) : null}
@@ -889,11 +940,11 @@ export default function App() {
         <section className="card">
           <h2>Report</h2>
           <div className="summary-grid">
-            <div><span className="muted">Pass rate</span><strong>{passRate}%</strong></div>
-            <div><span className="muted">Total</span><strong>{reportResults.length}</strong></div>
-            <div><span className="muted">Passed</span><strong>{String((report.summary || {}).passed || 0)}</strong></div>
-            <div><span className="muted">Failed</span><strong>{String((report.summary || {}).failed || 0)}</strong></div>
-            <div><span className="muted">Avg latency</span><strong>{Math.round(Number((report.summary || {}).avg_latency_ms || 0))}ms</strong></div>
+            <div><span className="muted">Progress</span><strong>{runBusy ? `${runProgress.done}/${runProgress.total}` : `${reportResults.length}/${reportResults.length}`}</strong></div>
+            <div><span className="muted">Pass rate</span><strong>{runBusy ? (runProgress.total ? Math.round((runProgress.pass / runProgress.total) * 100) : 0) : passRate}%</strong></div>
+            <div><span className="muted">Passed</span><strong>{runBusy ? runProgress.pass : String((report.summary || {}).passed || 0)}</strong></div>
+            <div><span className="muted">Failed</span><strong>{runBusy ? runProgress.fail : String((report.summary || {}).failed || 0)}</strong></div>
+            <div><span className="muted">Avg latency</span><strong>{runBusy ? `${runProgress.avgLatency}ms` : `${Math.round(Number((report.summary || {}).avg_latency_ms || 0))}ms`}</strong></div>
           </div>
           <details>
             <summary>Validation metrics</summary>
@@ -913,22 +964,37 @@ export default function App() {
                 </tr>
               </thead>
               <tbody>
-                {reportResults.map((r) => {
-                  const violated = r.rule_results.filter((x) => !x.ok).map((x) => x.rule_id).join(", ");
-                  const latency = typeof r.trace?.latency_ms === "number" ? `${r.trace.latency_ms}ms` : "-";
+                {reportTableRows.map(({ tc, r, status }) => {
+                  const isCurrent = runBusy && currentTestcaseId === tc.testcase_id;
+                  const rowStatus: LiveStatus = r ? "done" : isCurrent ? "running" : status;
+                  const violated = r ? r.rule_results.filter((x) => !x.ok).map((x) => x.rule_id).join(", ") : "";
+                  const latency = r && typeof r.trace?.latency_ms === "number" ? `${r.trace.latency_ms}ms` : "-";
+                  const canOpen = Boolean(r);
                   return (
-                    <tr key={r.testcase_id} onClick={() => setSelectedResult(r)}>
-                      <td>{r.testcase_id}</td>
-                      <td>{r.prompt.slice(0, 120)}{r.prompt.length > 120 ? "..." : ""}</td>
+                    <tr
+                      key={tc.testcase_id}
+                      ref={(el) => { rowRefs.current[tc.testcase_id] = el; }}
+                      className={isCurrent ? "row-current" : ""}
+                      onClick={() => { if (canOpen && r) setSelectedResult(r); }}
+                      style={{ cursor: canOpen ? "pointer" : "default" }}
+                    >
+                      <td>{tc.testcase_id}</td>
+                      <td>{tc.prompt.slice(0, 120)}{tc.prompt.length > 120 ? "..." : ""}</td>
                       <td>
-                        {(() => {
-                          const shown = extractResultForTable(r.response_text);
-                          return `${shown.slice(0, 120)}${shown.length > 120 ? "..." : ""}`;
-                        })()}
+                        {r ? (
+                          (() => {
+                            const shown = extractResultForTable(r.response_text);
+                            return `${shown.slice(0, 120)}${shown.length > 120 ? "..." : ""}`;
+                          })()
+                        ) : rowStatus === "running" ? (
+                          <span className="pending"><span className="spinner-xs" /> running</span>
+                        ) : (
+                          <span className="muted">queued</span>
+                        )}
                       </td>
-                      <td>{r.passed ? "pass" : "fail"}</td>
-                      <td>{violated || "-"}</td>
-                      <td>{latency}</td>
+                      <td>{r ? (r.passed ? "pass" : "fail") : "-"}</td>
+                      <td>{r ? (violated || "-") : "-"}</td>
+                      <td>{r ? latency : "-"}</td>
                     </tr>
                   );
                 })}
@@ -938,6 +1004,7 @@ export default function App() {
 
           <div className="actions">
             <button className="btn btn-ghost" onClick={exportReport}>Export JSON</button>
+            {runBusy ? <button className="btn btn-ghost" onClick={() => void stopCurrentRun()}>Stop Run</button> : null}
             <button className="btn btn-primary" onClick={newRun}>New run</button>
           </div>
         </section>
