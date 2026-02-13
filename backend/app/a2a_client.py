@@ -44,20 +44,26 @@ async def call_a2a(
 ) -> dict[str, Any]:
     t0 = time.time()
     try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
+        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
             r = await client.post(endpoint, json=payload, headers=headers)
             r.raise_for_status()
             data = r.json()
     except httpx.HTTPStatusError as e:
         status = e.response.status_code if e.response is not None else "unknown"
         body = ""
+        location = ""
         if e.response is not None:
             try:
                 body = (e.response.text or "")[:600]
             except Exception:
                 body = ""
+            try:
+                location = e.response.headers.get("location", "")
+            except Exception:
+                location = ""
         raise A2ARequestError(
-            f"Client/server error '{status}' for url '{endpoint}'. body='{body}'"
+            f"Client/server error '{status}' for url '{endpoint}'."
+            f"{' location=' + location if location else ''} body='{body}'"
         )
     except httpx.TimeoutException:
         raise A2ARequestError(f"Request timed out for url '{endpoint}'")

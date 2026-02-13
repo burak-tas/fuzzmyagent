@@ -73,8 +73,19 @@ function uid() {
 function normalizeEndpoint(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return "";
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
-  return `https://${trimmed}`;
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+
+  // Add trailing slash for path-based brokers (prevents common 404s),
+  // but do not touch explicit JSON resources.
+  try {
+    const u = new URL(withScheme);
+    if (u.pathname.endsWith(".json")) return u.toString();
+    if (!u.pathname.endsWith("/")) u.pathname = `${u.pathname}/`;
+    return u.toString();
+  } catch {
+    if (withScheme.endsWith(".json") || withScheme.endsWith("/")) return withScheme;
+    return `${withScheme}/`;
+  }
 }
 
 function escapeQuotes(v: string): string {

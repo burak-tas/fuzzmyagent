@@ -91,9 +91,23 @@ def _normalize_endpoint(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
         return ""
-    if text.startswith("http://") or text.startswith("https://"):
-        return text
-    return f"https://{text}"
+    if not (text.startswith("http://") or text.startswith("https://")):
+        text = f"https://{text}"
+
+    # Normalize trailing slash for path-based brokers.
+    # Important: do NOT append a slash to explicit JSON resources (e.g. agent-card.json).
+    try:
+        u = httpx.URL(text)
+        path = u.path or "/"
+        if path.endswith(".json"):
+            return str(u)
+        if not path.endswith("/"):
+            u = u.copy_with(path=f"{path}/")
+        return str(u)
+    except Exception:
+        if text.endswith(".json") or text.endswith("/"):
+            return text
+        return f"{text}/"
 
 
 def _endpoint_base(url: str) -> str:
@@ -267,7 +281,7 @@ async def _discover_agent_card(
         if c not in deduped_candidates:
             deduped_candidates.append(c)
 
-    async with httpx.AsyncClient(timeout=12) as client:
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
         for candidate in deduped_candidates:
             try:
                 r = await client.get(candidate, headers={"Accept": "application/json"})
